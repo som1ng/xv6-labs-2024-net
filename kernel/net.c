@@ -19,12 +19,35 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+// UDP Socket Implementation Structures
+#define NSOCK 16
+
+struct rx_entry {
+  char *buf;              // The raw packet buffer
+  int len;                // Length of the buffer
+  struct rx_entry *next;  // Next packet in the queue
+};
+
+struct sock {
+  int port;               // Local port (0 if unused)
+  struct spinlock lock;   // Protects the rx queue
+  struct rx_entry *rx_head; // Queue head
+  struct rx_entry *rx_tail; // Queue tail
+};
+
+static struct sock sockets[NSOCK];
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+  for(int i = 0; i < NSOCK; i++) {
+    initlock(&sockets[i].lock, "sock");
+    sockets[i].port = 0;
+    sockets[i].rx_head = 0;
+    sockets[i].rx_tail = 0;
+  }
 }
-
 
 //
 // bind(int port)
@@ -34,10 +57,29 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
+  int port;
+  argint(0, &port); // Changed: removed return value check
 
+  acquire(&netlock);
+  // Check if port is already bound
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == port) {
+      release(&netlock);
+      return -1;
+    }
+  }
+
+  // Find a free socket slot
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == 0) {
+      sockets[i].port = port;
+      sockets[i].rx_head = 0;
+      sockets[i].rx_tail = 0;
+      release(&netlock);
+      return 0;
+    }
+  }
+  release(&netlock);
   return -1;
 }
 
@@ -49,10 +91,32 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
+  int port;
+  argint(0, &port); // Changed: removed return value check
 
+  acquire(&netlock);
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == port) {
+      acquire(&sockets[i].lock);
+      sockets[i].port = 0; // Mark as free
+
+      // Free any pending packets in the queue
+      struct rx_entry *e = sockets[i].rx_head;
+      while(e) {
+        struct rx_entry *next = e->next;
+        kfree(e->buf);
+        kfree((char*)e);
+        e = next;
+      }
+      sockets[i].rx_head = 0;
+      sockets[i].rx_tail = 0;
+      
+      release(&sockets[i].lock);
+      release(&netlock);
+      return 0;
+    }
+  }
+  release(&netlock);
   return 0;
 }
 
@@ -74,10 +138,77 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  int dport;
+  uint64 src_ip_addr;
+  uint64 src_port_addr;
+  uint64 buf_addr;
+  int maxlen;
+
+  // Changed: removed return value checks as argint/argaddr return void
+  argint(0, &dport);
+  argaddr(1, &src_ip_addr);
+  argaddr(2, &src_port_addr);
+  argaddr(3, &buf_addr);
+  argint(4, &maxlen);
+
+  struct sock *s = 0;
+
+  // Find the socket
+  acquire(&netlock);
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == dport) {
+      s = &sockets[i];
+      acquire(&s->lock); // Lock the socket before releasing global lock
+      break;
+    }
+  }
+  release(&netlock);
+
+  if(s == 0)
+    return -1;
+
+  // Wait for packets
+  while(s->rx_head == 0) {
+    if(myproc()->killed) {
+      release(&s->lock);
+      return -1;
+    }
+    sleep(s, &s->lock);
+  }
+
+  // Dequeue packet
+  struct rx_entry *e = s->rx_head;
+  s->rx_head = e->next;
+  if(s->rx_head == 0)
+    s->rx_tail = 0;
+  release(&s->lock);
+
+  // Parse packet headers
+  struct eth *eth = (struct eth*)e->buf;
+  struct ip *ip = (struct ip*)(eth + 1);
+  struct udp *udp = (struct udp*)(ip + 1);
+  char *payload = (char*)(udp + 1);
+
+  uint32 src_ip = ntohl(ip->ip_src);
+  uint16 src_port = ntohs(udp->sport);
+  int payload_len = ntohs(udp->ulen) - sizeof(struct udp);
+  
+  int copylen = (payload_len < maxlen) ? payload_len : maxlen;
+
+  // Copy to user space
+  if(copyout(myproc()->pagetable, src_ip_addr, (char*)&src_ip, sizeof(src_ip)) < 0 ||
+     copyout(myproc()->pagetable, src_port_addr, (char*)&src_port, sizeof(src_port)) < 0 ||
+     copyout(myproc()->pagetable, buf_addr, payload, copylen) < 0) {
+       kfree(e->buf);
+       kfree((char*)e);
+       return -1;
+  }
+
+  // Free resources
+  kfree(e->buf);
+  kfree((char*)e);
+
+  return copylen;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -188,10 +319,73 @@ ip_rx(char *buf, int len)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  // Check buffer length validity for IP header
+  if(len < sizeof(struct eth) + sizeof(struct ip)) {
+    kfree(buf);
+    return;
+  }
+
+  struct ip *ip = (struct ip*)(buf + sizeof(struct eth));
+
+  // Verify IP Checksum
+  if(in_cksum((unsigned char*)ip, sizeof(struct ip)) != 0) {
+    kfree(buf);
+    return;
+  }
+
+  // Check if it is UDP
+  if(ip->ip_p != IPPROTO_UDP) {
+    kfree(buf);
+    return;
+  }
+
+  // Check buffer length validity for UDP header
+  if(len < sizeof(struct eth) + sizeof(struct ip) + sizeof(struct udp)) {
+    kfree(buf);
+    return;
+  }
+
+  struct udp *udp = (struct udp*)(ip + 1);
+  uint16 dport = ntohs(udp->dport);
+
+  // Find destination socket
+  struct sock *s = 0;
+  acquire(&netlock);
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == dport) {
+      s = &sockets[i];
+      acquire(&s->lock);
+      break;
+    }
+  }
+  release(&netlock);
+
+  // If socket found, enqueue the packet
+  if(s) {
+    struct rx_entry *e = (struct rx_entry*)kalloc();
+    if(e == 0) {
+      release(&s->lock);
+      kfree(buf);
+      return;
+    }
+    
+    e->buf = buf;
+    e->len = len;
+    e->next = 0;
+
+    if(s->rx_tail) {
+      s->rx_tail->next = e;
+    } else {
+      s->rx_head = e;
+    }
+    s->rx_tail = e;
+    
+    wakeup(s); // Wake up sys_recv
+    release(&s->lock);
+  } else {
+    // No socket bound to this port, drop packet
+    kfree(buf);
+  }
 }
 
 //
@@ -219,7 +413,7 @@ arp_rx(char *inbuf)
   char *buf = kalloc();
   if(buf == 0)
     panic("send_arp_reply");
-  
+
   struct eth *eth = (struct eth *) buf;
   memmove(eth->dhost, ineth->shost, ETHADDR_LEN); // ethernet destination = query source
   memmove(eth->shost, local_mac, ETHADDR_LEN); // ethernet source = xv6's ethernet address
